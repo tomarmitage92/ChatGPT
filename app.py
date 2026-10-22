@@ -6,7 +6,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from fred_data import SERIES, FredError, chart_data, fetch_series, latest_summary, period_label
+from fred_data import SERIES, FredError, chart_data, data_url, fetch_series, latest_summary, period_label
 
 
 st.set_page_config(page_title="Consumer financial health", page_icon="📊", layout="wide")
@@ -23,7 +23,8 @@ def make_chart(frame, series):
     plot["segment"] = plot.value.isna().cumsum()
     plot["period"] = plot.date.map(lambda date: period_label(date, series.frequency))
     base = alt.Chart(plot).encode(
-        x=alt.X("date:T", title=None, axis=alt.Axis(format="%Y", grid=False)),
+        x=alt.X("date:T", title=None,
+                axis=alt.Axis(format="%Y", tickCount="year", labelOverlap=True, grid=False)),
         y=alt.Y("value:Q", title=series.unit, scale=alt.Scale(zero=True)),
         tooltip=[alt.Tooltip("period:N", title="Period"),
                  alt.Tooltip("value:Q", title=series.unit, format=".2f")],
@@ -61,7 +62,7 @@ years = {"5 years": 5, "10 years": 10, "20 years": 20}.get(window)
 start = end - pd.DateOffset(years=years) if years else None
 
 if not available:
-    st.warning("Live FRED data is unavailable. The three charts will populate when access is enabled and you select Refresh data. No sample data is displayed.")
+    st.warning("Unable to load FRED data. See the error details below, then select Refresh data to retry. No sample data is displayed.")
 
 for series, (result, error) in zip(SERIES, results):
     with st.container(border=True):
@@ -89,7 +90,7 @@ for series, (result, error) in zip(SERIES, results):
         with st.expander("Definition, source and data"):
             st.write(series.definition)
             st.markdown(f"[FRED series and release notes]({series.source_url}) · "
-                        f"[Original CSV](https://fred.stlouisfed.org/graph/graph.csv?id={series.id})")
+                        f"[Original observation table]({data_url(series.id)})")
             st.caption("FRED aggregates data from BEA (income and saving) and the Federal Reserve Board (debt service). "
                        "Observations can be revised; this app uses the latest available vintage. "
                        "Dates identify observation periods, not release dates. Missing values remain gaps.")

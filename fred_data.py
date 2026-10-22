@@ -1,8 +1,12 @@
-"""Public FRED CSV downloads and calendar-aligned transformations."""
+"""Public FRED observation tables and calendar-aligned transformations."""
 
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from io import StringIO
+import re
+import ssl
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -53,6 +57,83 @@ class FredError(ValueError):
     """A source could not be retrieved or validated."""
 
 
+def data_url(series_id: str) -> str:
+    return f"https://fred.stlouisfed.org/data/{series_id}.txt"
+
+
+class _ObservationTableParser(HTMLParser):
+    """Read only FRED's explicitly identified metadata and observation tables."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables = {"metadata": [], "observations": []}
+        self.kind = None
+        self.depth = 0
+        self.row = None
+        self.cell = None
+        self.closed = set()
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "table":
+            if self.kind:
+                self.depth += 1
+            elif attrs.get("id") == "data-table-observations":
+                self.kind, self.depth = "observations", 1
+            elif attrs.get("aria-label", "").startswith("metadata - "):
+                self.kind, self.depth = "metadata", 1
+        if self.kind and self.depth == 1:
+            if tag == "tr":
+                self.row = []
+            elif tag in ("td", "th") and self.row is not None:
+                self.cell = []
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag):
+        if not self.kind:
+            return
+        if self.depth == 1:
+            if tag in ("td", "th") and self.cell is not None:
+                self.row.append("".join(self.cell).strip())
+                self.cell = None
+            elif tag == "tr" and self.row is not None:
+                self.tables[self.kind].append(self.row)
+                self.row = None
+        if tag == "table":
+            self.depth -= 1
+            if self.depth == 0:
+                self.closed.add(self.kind)
+                self.kind = None
+
+
+def parse_table(text: str, series_id: str) -> pd.DataFrame:
+    parser = _ObservationTableParser()
+    parser.feed(text)
+    parser.close()
+    if parser.closed != {"metadata", "observations"}:
+        raise FredError(f"FRED did not return complete data tables for {series_id}.")
+    metadata = {row[0]: row[1] for row in parser.tables["metadata"] if len(row) == 2}
+    rows = parser.tables["observations"]
+    if metadata.get("Series ID") != series_id:
+        raise FredError(f"FRED returned a different series than {series_id}.")
+    if not rows or rows[0] != ["DATE", "VALUE"] or any(len(row) != 2 for row in rows):
+        raise FredError(f"FRED's observation table format changed for {series_id}.")
+    # Reuse the same strict numeric, missing-value and date checks as CSV ingestion.
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["DATE", series_id])
+    writer.writerows(rows[1:])
+    frame = parse_csv(buffer.getvalue(), series_id)
+    coverage = re.fullmatch(r"(\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})", metadata.get("Date Range", ""))
+    if (not coverage or frame.date.min() != pd.Timestamp(coverage[1])
+            or frame.date.max() != pd.Timestamp(coverage[2])):
+        raise FredError(f"FRED's observations do not match its advertised date range for {series_id}.")
+    return frame
+
+
 def parse_csv(text: str, series_id: str) -> pd.DataFrame:
     try:
         frame = pd.read_csv(StringIO(text), dtype=str, keep_default_na=False)
@@ -77,17 +158,28 @@ def parse_csv(text: str, series_id: str) -> pd.DataFrame:
 def fetch_series(series_id: str) -> tuple[pd.DataFrame, str]:
     if series_id not in {series.id for series in SERIES}:
         raise FredError("Unknown series.")
-    url = f"https://fred.stlouisfed.org/graph/graph.csv?id={series_id}"
+    url = data_url(series_id)
     request = Request(url, headers={"User-Agent": "ConsumerHealthDashboard/1.0"})
     try:
         with urlopen(request, timeout=15) as response:
             text = response.read().decode("utf-8-sig")
-    except (HTTPError, URLError, TimeoutError, UnicodeError, OSError) as exc:
+    except HTTPError as exc:
         raise FredError(
-            f"Could not download {series_id} from FRED. Check internet access to "
-            "fred.stlouisfed.org and try Refresh data. No API key is needed."
+            f"FRED returned HTTP {exc.code} for {series_id}. "
+            "Try Refresh data. If it persists, check this app's access to fred.stlouisfed.org."
         ) from exc
-    return parse_csv(text, series_id), datetime.now(timezone.utc).isoformat()
+    except (URLError, TimeoutError, UnicodeError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (TimeoutError,)):
+            detail = "The request timed out."
+        elif isinstance(reason, ssl.SSLError):
+            detail = "The secure connection could not be verified."
+        elif isinstance(reason, UnicodeError):
+            detail = "The response could not be decoded."
+        else:
+            detail = "A connection to fred.stlouisfed.org could not be established."
+        raise FredError(f"Could not load {series_id} from FRED. {detail} Try Refresh data.") from exc
+    return parse_table(text, series_id), datetime.now(timezone.utc).isoformat()
 
 
 def chart_data(raw: pd.DataFrame, growth: bool = False, frequency: str = "MS") -> pd.DataFrame:

@@ -1,13 +1,58 @@
 from unittest.mock import patch
 from pathlib import Path
+from io import BytesIO
+from urllib.error import HTTPError
 
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from fred_data import FredError, chart_data, latest_summary, parse_csv, period_label
+from fred_data import FredError, chart_data, fetch_series, latest_summary, parse_csv, parse_table, period_label
 
 APP = str(Path(__file__).resolve().parents[1] / "app.py")
+
+
+def observation_page():
+    # A minimal synthetic version of FRED's actual public table structure.
+    return '''<html><table><tr><td>Unrelated navigation</td></tr></table>
+    <table aria-label="metadata - Personal Saving Rate"><tbody>
+    <tr><th>Series ID</th><td>PSAVERT</td></tr>
+    <tr><th>Date Range</th><td>2024-01-01 to 2024-03-01</td></tr>
+    </tbody></table>
+    <table id="data-table-observations"><thead><tr><th>DATE</th><th>VALUE</th></tr></thead>
+    <tbody><tr><th>2024-01-01</th><td> 4.2 </td></tr>
+    <tr><th>2024-02-01</th><td>.</td></tr>
+    <tr><th>2024-03-01</th><td>4.3</td></tr></tbody></table></html>'''
+
+
+def test_official_table_and_transport():
+    with patch("fred_data.urlopen", return_value=BytesIO(observation_page().encode())) as request:
+        frame, fetched_at = fetch_series("PSAVERT")
+    assert request.call_args.args[0].full_url == "https://fred.stlouisfed.org/data/PSAVERT.txt"
+    assert len(frame) == 3
+    assert frame.value.iloc[0] == 4.2
+    assert pd.isna(frame.value.iloc[1])
+    assert fetched_at.endswith("+00:00")
+
+
+@pytest.mark.parametrize("text", [
+    "<html>Access denied</html>",
+    observation_page().replace("<td>PSAVERT</td>", "<td>TDSP</td>"),
+    observation_page().replace("to 2024-03-01", "to 2024-04-01"),
+    observation_page().replace("<td>4.3</td>", "<td>invalid</td>"),
+    observation_page().replace("<th>VALUE</th>", "<th>CHANGED</th>"),
+    observation_page().rsplit("</table>", 1)[0],
+])
+def test_table_rejects_wrong_series_incomplete_coverage_and_changed_format(text):
+    with pytest.raises(FredError):
+        parse_table(text, "PSAVERT")
+
+
+def test_http_failure_reports_status():
+    error = HTTPError("https://fred.stlouisfed.org/data/PSAVERT.txt", 403, "Forbidden", {}, None)
+    with patch("fred_data.urlopen", side_effect=error):
+        with pytest.raises(FredError, match="HTTP 403"):
+            fetch_series("PSAVERT")
 
 
 def test_missing_values_and_invalid_csv():

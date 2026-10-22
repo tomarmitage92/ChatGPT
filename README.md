@@ -1,6 +1,6 @@
 # Consumer financial health
 
-A three-chart Streamlit dashboard for US consumer financial conditions, using public FRED CSV downloads. No API key required.
+A three-chart Streamlit dashboard for US consumer financial conditions, using FRED's public observation tables. No API key required.
 
 | Chart | FRED series | Measurement |
 | --- | --- | --- |
@@ -22,7 +22,9 @@ Use your hosting platform's supported application preview or deployment to view 
 
 ## Network access
 
-Outbound HTTPS access to **fred.stlouisfed.org** is required at runtime. Package installation uses **pypi.org** and **files.pythonhosted.org**. The FRED network requirement has been saved in the cloud environment draft; review and save it in environment settings, then publish the environment to activate the configuration. Refresh the dashboard after access becomes available.
+Outbound HTTPS access to **fred.stlouisfed.org** is required at runtime. Package installation uses **pypi.org** and **files.pythonhosted.org**. The cloud workspace and Streamlit Community Cloud have separate network settings; publishing the workspace configuration does not change Streamlit's access.
+
+The app reads `https://fred.stlouisfed.org/data/<series>.txt`. Despite the `.txt` suffix, FRED currently serves an HTML page containing the full observation table and series metadata. The parser selects only that table, verifies the series ID and advertised date range, and validates dates and numeric values. The older `/graph/graph.csv` address returned HTTP 404 during investigation and is no longer used. No browser automation or additional parsing dependencies are needed.
 
 If FRED cannot be reached, each affected panel shows an error; the app never substitutes fabricated data. A successful download is cached in memory for one hour. **Refresh data** clears that cache and fetches again. No background refresh job is installed. Each panel shows its observation period and download timestamp; monthly and quarterly releases do not share a common latest date.
 
