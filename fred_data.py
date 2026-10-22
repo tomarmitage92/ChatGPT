@@ -1,16 +1,24 @@
 """Public FRED observation tables and calendar-aligned transformations."""
 
 import csv
+import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from io import StringIO
+from pathlib import Path
 import re
 import ssl
+import tempfile
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pandas as pd
+
+BUNDLE_DIR = Path(__file__).resolve().parent / "data"
+CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "fred"
 
 
 @dataclass(frozen=True)
@@ -155,31 +163,113 @@ def parse_csv(text: str, series_id: str) -> pd.DataFrame:
         raise FredError(f"Invalid FRED CSV for {series_id}: {exc}") from exc
 
 
-def fetch_series(series_id: str) -> tuple[pd.DataFrame, str]:
+def fetch_series(series_id: str, timeout: float = 30, attempts: int = 2) -> tuple[pd.DataFrame, str]:
     if series_id not in {series.id for series in SERIES}:
         raise FredError("Unknown series.")
+    if timeout <= 0 or attempts < 1:
+        raise ValueError("A positive timeout and at least one attempt are required.")
     url = data_url(series_id)
     request = Request(url, headers={"User-Agent": "ConsumerHealthDashboard/1.0"})
-    try:
-        with urlopen(request, timeout=15) as response:
-            text = response.read().decode("utf-8-sig")
-    except HTTPError as exc:
-        raise FredError(
+    for attempt in range(attempts):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                text = response.read().decode("utf-8-sig")
+            break
+        except (URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            retryable = (
+                exc.code in (429, 500, 502, 503, 504) if isinstance(exc, HTTPError)
+                else not isinstance(reason, ssl.SSLError)
+            )
+            if retryable and attempt + 1 < attempts:
+                time.sleep(1)
+                continue
+            raise _download_error(series_id, exc) from exc
+        except UnicodeError as exc:
+            raise _download_error(series_id, exc) from exc
+    return parse_table(text, series_id), datetime.now(timezone.utc).isoformat()
+
+
+def _download_error(series_id, exc):
+    if isinstance(exc, HTTPError):
+        return FredError(
             f"FRED returned HTTP {exc.code} for {series_id}. "
             "Try Refresh data. If it persists, check this app's access to fred.stlouisfed.org."
-        ) from exc
-    except (URLError, TimeoutError, UnicodeError, OSError) as exc:
-        reason = getattr(exc, "reason", exc)
-        if isinstance(reason, (TimeoutError,)):
-            detail = "The request timed out."
-        elif isinstance(reason, ssl.SSLError):
-            detail = "The secure connection could not be verified."
-        elif isinstance(reason, UnicodeError):
-            detail = "The response could not be decoded."
-        else:
-            detail = "A connection to fred.stlouisfed.org could not be established."
-        raise FredError(f"Could not load {series_id} from FRED. {detail} Try Refresh data.") from exc
-    return parse_table(text, series_id), datetime.now(timezone.utc).isoformat()
+        )
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, TimeoutError):
+        detail = "The request timed out."
+    elif isinstance(reason, ssl.SSLError):
+        detail = "The secure connection could not be verified."
+    elif isinstance(reason, UnicodeError):
+        detail = "The response could not be decoded."
+    else:
+        detail = "A connection to fred.stlouisfed.org could not be established."
+    return FredError(f"Could not load {series_id} from FRED. {detail} Try Refresh data.")
+
+
+def write_snapshot(series_id, frame, fetched_at, directory):
+    """Save an actual, validated FRED download atomically, with source provenance."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "series_id": series_id,
+        "source_url": data_url(series_id),
+        "fetched_at": fetched_at,
+        "observations": [
+            [row.date.strftime("%Y-%m-%d"), None if pd.isna(row.value) else float(row.value)]
+            for row in frame.itertuples(index=False)
+        ],
+    }
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as file:
+            temporary = Path(file.name)
+            json.dump(payload, file, allow_nan=False, indent=2)
+            file.write("\n")
+        os.replace(temporary, directory / f"{series_id}.json")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def read_snapshot(series_id, directory):
+    payload = json.loads((Path(directory) / f"{series_id}.json").read_text(encoding="utf-8"))
+    if payload["series_id"] != series_id or payload["source_url"] != data_url(series_id):
+        raise FredError("The saved FRED snapshot has incorrect source metadata.")
+    fetched_at = datetime.fromisoformat(payload["fetched_at"])
+    if fetched_at.tzinfo is None or fetched_at > datetime.now(timezone.utc):
+        raise FredError("The saved FRED snapshot has an invalid download timestamp.")
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["DATE", series_id])
+    for date, value in payload["observations"]:
+        writer.writerow([date, "." if value is None else value])
+    return parse_csv(buffer.getvalue(), series_id), fetched_at.isoformat()
+
+
+def get_series(series_id, timeout=10):
+    """Try live data, then the newest valid local or bundled real-data snapshot."""
+    try:
+        result = fetch_series(series_id, timeout=timeout)
+    except FredError as exc:
+        snapshots = []
+        for directory in (CACHE_DIR, BUNDLE_DIR):
+            try:
+                snapshots.append(read_snapshot(series_id, directory))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        if not snapshots:
+            return None, str(exc)
+        result = max(snapshots, key=lambda snapshot: datetime.fromisoformat(snapshot[1]))
+        downloaded = datetime.fromisoformat(result[1]).strftime("%d %b %Y, %H:%M UTC")
+        return result, f"Showing saved FRED data downloaded {downloaded}. Live update failed: {exc}"
+    try:
+        write_snapshot(series_id, *result, CACHE_DIR)
+    except OSError:
+        # Read-only hosting must not prevent displaying a successful live response.
+        pass
+    return result, None
 
 
 def chart_data(raw: pd.DataFrame, growth: bool = False, frequency: str = "MS") -> pd.DataFrame:

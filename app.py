@@ -1,20 +1,23 @@
 """Run with: .venv/bin/streamlit run app.py"""
 
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from fred_data import SERIES, FredError, chart_data, data_url, fetch_series, latest_summary, period_label
+from fred_data import SERIES, chart_data, data_url, get_series, latest_summary, period_label
 
 
 st.set_page_config(page_title="Consumer financial health", page_icon="📊", layout="wide")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_series(series_id):
-    return fetch_series(series_id)
+def load_series(timeout):
+    # The worker threads do no Streamlit work; independent downloads run together.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        return list(pool.map(lambda series: get_series(series.id, timeout=timeout), SERIES))
 
 
 def make_chart(frame, series):
@@ -43,19 +46,12 @@ with controls:
 with action:
     if st.button("Refresh data", width="stretch"):
         load_series.clear()
+        st.session_state["download_timeout"] = 30
 
-st.caption("Latest available observations are shown separately for each series; release dates differ. Refreshes are cached for one hour.")
+st.caption("Observation dates differ by series. Results are cached for one hour; saved-data warnings identify downloads that could not be refreshed.")
 
-
-def load_safely(series):
-    try:
-        return load_series(series.id), None
-    except FredError as exc:
-        return None, str(exc)
-
-
-# Keep Streamlit's cache on the script thread; three bounded requests allow partial success.
-results = [load_safely(series) for series in SERIES]
+with st.spinner("Checking FRED for updates… Saved data will be used if FRED is unavailable."):
+    results = load_series(st.session_state.get("download_timeout", 10))
 available = [result[0][0].date.max() for result in results if result[0] is not None]
 end = max(available) if available else pd.Timestamp.today().normalize()
 years = {"5 years": 5, "10 years": 10, "20 years": 20}.get(window)
@@ -68,10 +64,12 @@ for series, (result, error) in zip(SERIES, results):
     with st.container(border=True):
         st.subheader(series.title)
         st.caption(f"{series.frequency} · {series.unit} · {series.id}")
-        if error:
+        if result is None:
             st.error(error)
             st.link_button("View series on FRED", series.source_url)
             continue
+        if error:
+            st.warning(error)
         raw, fetched_at = result
         frame = chart_data(raw, growth=series.growth,
                            frequency="QS" if series.frequency == "Quarterly" else "MS")
@@ -92,7 +90,7 @@ for series, (result, error) in zip(SERIES, results):
             st.markdown(f"[FRED series and release notes]({series.source_url}) · "
                         f"[Original observation table]({data_url(series.id)})")
             st.caption("FRED aggregates data from BEA (income and saving) and the Federal Reserve Board (debt service). "
-                       "Observations can be revised; this app uses the latest available vintage. "
+                       "Observations can be revised; saved downloads may not include later revisions. "
                        "Dates identify observation periods, not release dates. Missing values remain gaps.")
             st.caption(f"Fetched {datetime.fromisoformat(fetched_at).strftime('%d %b %Y, %H:%M UTC')}.")
             export = view.rename(columns={"value": series.unit})
